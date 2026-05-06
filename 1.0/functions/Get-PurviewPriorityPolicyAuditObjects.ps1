@@ -177,9 +177,31 @@
                 }
             }
             catch {
-                Write-ToLogFile -StringObject "$(Get-TimeStamp) ERROR: Search-UnifiedAuditLog failed: $($_.Exception.Message)" -LogDirectory $LogDirectory
-                Write-Host "ERROR: Audit log retrieval failed: $($_.Exception.Message)" -ForegroundColor Red
-                break
+                $errMsg = $_.Exception.Message
+
+                # Detect broken/missing Exchange Online session — HttpResponseMessage.GetResponseHeader
+                # is called internally by the EXO V3 module and throws this specific error when no
+                # active session exists or the session token has expired.
+                $isSessionError = $errMsg -match 'GetResponseHeader' -or
+                                  $errMsg -match 'HttpResponseMessage' -or
+                                  $errMsg -match 'not connected' -or
+                                  $errMsg -match 'no active.*session' -or
+                                  $errMsg -match 'Connect-ExchangeOnline'
+
+                Write-Progress -Activity 'Get-PurviewPriorityPolicyAuditObjects' -Completed
+
+                if ($isSessionError) {
+                    Write-ToLogFile -StringObject "$(Get-TimeStamp) ERROR: No active Exchange Online session detected. Run Connect-ExchangeOnline first, or re-run with -ConnectExchangeOnline. Detail: $errMsg" -LogDirectory $LogDirectory -ForegroundColor Red
+                    Write-Host ""
+                    Write-Host "ERROR: No active Exchange Online session was found." -ForegroundColor Red
+                    Write-Host "  Action required: Run 'Connect-ExchangeOnline' before calling this function," -ForegroundColor Yellow
+                    Write-Host "  or re-run with the -ConnectExchangeOnline switch to connect automatically." -ForegroundColor Yellow
+                }
+                else {
+                    Write-ToLogFile -StringObject "$(Get-TimeStamp) ERROR: Search-UnifiedAuditLog failed: $errMsg" -LogDirectory $LogDirectory
+                    Write-Host "ERROR: Audit log retrieval failed: $errMsg" -ForegroundColor Red
+                }
+                return
             }
         } while ($batch -and $batch.Count -gt 0)
 
