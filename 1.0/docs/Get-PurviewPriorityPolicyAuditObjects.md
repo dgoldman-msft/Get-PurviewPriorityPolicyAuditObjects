@@ -18,8 +18,10 @@ Get-PurviewPriorityPolicyAuditObjects
     [-StartDate <DateTime>]
     [-EndDate <DateTime>]
     [-ConnectExchangeOnline]
+    [-DisableBanner]
     [-ExportResults]
     [-ShowDetails]
+    [-DumpErrors]
     [-LogDirectory <String>]
     [<CommonParameters>]
 ```
@@ -30,9 +32,11 @@ Queries the Unified Audit Log via `Search-UnifiedAuditLog` and filters for event
 
 The function uses session-based paging (`-SessionCommand ReturnLargeSet`, 5 000 records per page) to retrieve the full result set for the specified date range. A progress bar is displayed during retrieval showing the current page number and running record count.
 
-Each matched record is parsed and normalised into a typed `PurviewPriorityAuditResult` object. Results are sorted by `CreationTime` and emitted to the pipeline. Optionally they can be exported to a timestamped CSV file.
+Each matched record is parsed and normalised into a typed `PurviewPriorityAuditResult` object. The original unmodified JSON string is preserved in `RawAuditDataJson`. Results are sorted by `CreationTime` and emitted to the pipeline. Optionally they can be exported to a timestamped CSV file.
 
-Requires an active Exchange Online PowerShell session (`Connect-ExchangeOnline`). Use `-ConnectExchangeOnline` to have the function connect and disconnect automatically.
+Use `-DumpErrors` to write all error `AuditData` fields to `Errors.log`. Error events are always stored in `$global:PurviewAuditErrors`.
+
+Requires active Exchange Online and Security & Compliance Center sessions (`Connect-ExchangeOnline` and `Connect-IPPSSession`). Use `-ConnectExchangeOnline` to have the function connect and disconnect both sessions automatically.
 
 ## EXAMPLES
 
@@ -90,6 +94,32 @@ Get-PurviewPriorityPolicyAuditObjects -ConnectExchangeOnline `
 
 Writes `Logging.txt` and the CSV export to a custom path instead of the default `$env:TEMP\PurviewPriorityAudit\` folder.
 
+### Example 7: Connect without the banner
+
+```powershell
+Get-PurviewPriorityPolicyAuditObjects -ConnectExchangeOnline -DisableBanner
+```
+
+Passes `-ShowBanner:$false` to both `Connect-ExchangeOnline` and `Connect-IPPSSession`, suppressing the connection banner. Useful in automated or CI/CD contexts where the banner adds noise to captured output.
+
+### Example 8: Dump full error details to Errors.log
+
+```powershell
+Get-PurviewPriorityPolicyAuditObjects -ConnectExchangeOnline -DumpErrors
+```
+
+For every event where `CompletionStatus = Error`, writes all `AuditData` fields (depth 20, multi-line) to `Errors.log` in `-LogDirectory`.
+
+### Example 9: Inspect post-run globals
+
+```powershell
+# Error events from the last run
+$global:PurviewAuditErrors | Format-Table CreationTime, Operation, User, CompletionStatus, RecordType, OrganizationId, ObjectId -AutoSize
+
+# Raw unmodified AuditData JSON for the first error
+$global:PurviewAuditErrors[0].RawAuditDataJson
+```
+
 ## PARAMETERS
 
 ### -StartDate
@@ -130,9 +160,27 @@ Accept wildcard characters: False
 
 ### -ConnectExchangeOnline
 
-When specified, the function checks for the `ExchangeOnlineManagement` module, installs it from PSGallery if absent, imports it, and calls `Connect-ExchangeOnline`. In the `end` block the session is automatically closed via `Disconnect-ExchangeOnline`.
+When specified, the function checks for the `ExchangeOnlineManagement` module, installs it from PSGallery if absent, imports it, and calls both `Connect-ExchangeOnline` and `Connect-IPPSSession` (Security & Compliance Center). In the `end` block both sessions are automatically closed via `Disconnect-ExchangeOnline`.
 
-If an active session already exists, omit this switch and the function will use the existing connection.
+If active sessions already exist, omit this switch and the function will use the existing connections.
+
+```yaml
+Type: SwitchParameter
+Parameter Sets: (All)
+Aliases:
+
+Required: False
+Position: Named
+Default value: False
+Accept pipeline input: False
+Accept wildcard characters: False
+```
+
+### -DisableBanner
+
+When specified together with `-ConnectExchangeOnline`, passes `-ShowBanner:$false` to both `Connect-ExchangeOnline` and `Connect-IPPSSession` to suppress the EXO module connection banner.
+
+Has no effect if `-ConnectExchangeOnline` is not also specified.
 
 ```yaml
 Type: SwitchParameter
@@ -148,7 +196,7 @@ Accept wildcard characters: False
 
 ### -ExportResults
 
-When specified, exports the sorted results to a CSV file named `PurviewPriorityAudit_<yyyyMMdd_HHmmss>.csv` inside `-LogDirectory`. The CSV includes all normalised properties except `RawAuditData`.
+When specified, exports the sorted results to a CSV file named `PurviewPriorityAudit_<yyyyMMdd_HHmmss>.csv` inside `-LogDirectory`. The CSV includes all normalised properties.
 
 ```yaml
 Type: SwitchParameter
@@ -164,7 +212,7 @@ Accept wildcard characters: False
 
 ### -ShowDetails
 
-When specified, writes a colour-coded per-record detail block to the console after the retrieval loop completes. Each block shows the fixed summary fields followed by every property present in the `RawAuditData` JSON object, sorted alphabetically. Nested objects and arrays are rendered as compact JSON inline.
+When specified, writes a colour-coded per-record detail block to the console after the retrieval loop completes. Each block shows the fixed summary fields followed by every property present in the parsed `RawAuditDataJson` payload, sorted alphabetically. Nested objects and arrays are rendered as compact JSON inline. `Parameters` and `NonPIIParameters` fields are expanded so each `-Name "Value"` pair appears on its own line.
 
 Objects are emitted to the pipeline regardless of whether this switch is set.
 
@@ -180,9 +228,25 @@ Accept pipeline input: False
 Accept wildcard characters: False
 ```
 
+### -DumpErrors
+
+When specified, writes a detailed block to `Errors.log` in `-LogDirectory` for every event where `CompletionStatus = Error`. The block includes all fields from the record's `AuditData` JSON, serialised to depth 20 with no truncation. Each error event is also stamped with a `Diagnosis` property containing a human-readable likely cause derived from the parameter values present in the audit record. Operations with active diagnosis logic: `New-ComplianceTag` (RetentionDuration, RetentionAction, RetentionType, PriorityCleanup rules), `Set-ComplianceTag` (RetentionDuration), `New-RetentionComplianceRule` (RetentionDuration, RetentionComplianceAction, ExpirationDateOption). Policy cmdlets (`New/Set-RetentionCompliancePolicy`) return `Unknown` — they carry no diagnosable retention parameters in their audit data.
+
+```yaml
+Type: SwitchParameter
+Parameter Sets: (All)
+Aliases:
+
+Required: False
+Position: Named
+Default value: False
+Accept pipeline input: False
+Accept wildcard characters: False
+```
+
 ### -LogDirectory
 
-Full path to the directory used for `Logging.txt` and any CSV exports. The directory is created automatically if it does not exist.
+Full path to the directory used for `Logging.txt`, `Errors.log`, and any CSV exports. The directory is created automatically if it does not exist.
 
 Defaults to `$env:TEMP\PurviewPriorityAudit`.
 
@@ -227,15 +291,17 @@ One object per matched audit event. The default `Format-Table` view shows `Creat
 | `ItemType` | String | Item type from AuditData |
 | `Action` | String | `Operation` field from inside the AuditData JSON |
 | `AuditEvent` | String | `AuditEvent` field from inside the AuditData JSON |
-| `RawAuditData` | PSCustomObject | Full parsed AuditData JSON — all fields returned by the API |
+| `RawAuditDataJson` | String | Original unmodified AuditData JSON string as returned by the UAL API |
 
 ## NOTES
 
 - Requires the **Audit Logs** role in Exchange Online (included in Compliance Administrator, Security Administrator, and Global Administrator).
 - The Unified Audit Log must be enabled for the tenant. See [Turn auditing on or off](https://learn.microsoft.com/en-us/purview/audit-log-enable-disable).
+- `-ConnectExchangeOnline` calls both `Connect-ExchangeOnline` (for `Search-UnifiedAuditLog`) and `Connect-IPPSSession` (Security & Compliance Center). A single `Disconnect-ExchangeOnline` closes both sessions.
 - Session-based paging retrieves up to 5 000 records per request. For large tenants or long date ranges the retrieval loop may take several minutes.
 - The function uses `-HighCompleteness` to maximise result accuracy at the cost of some additional latency.
-- All runs append to `Logging.txt` in `-LogDirectory`. Rotate or archive this file as needed.
+- All error events from the last run are in `$global:PurviewAuditErrors`. Each object has a `Diagnosis` property with the likely cause stamped automatically.
+- All runs append to `Logging.txt` in `-LogDirectory`. When `-DumpErrors` is specified, `Errors.log` is written to the same directory. Rotate or archive these files as needed.
 
 **Aliases:** `GPPPAudit`, `Get-PriorityPolicyAudit`
 
@@ -244,5 +310,11 @@ One object per matched audit event. The default `Format-Table` view shows `Creat
 - [Project repository](https://github.com/dgoldman-msft/Get-PurviewPriorityPolicyAuditObjects)
 - [Search-UnifiedAuditLog](https://learn.microsoft.com/en-us/powershell/module/exchange/search-unifiedauditlog)
 - [Connect-ExchangeOnline](https://learn.microsoft.com/en-us/powershell/module/exchange/connect-exchangeonline)
+- [Connect-IPPSSession](https://learn.microsoft.com/en-us/powershell/module/exchange/connect-ippssession)
 - [Turn auditing on or off](https://learn.microsoft.com/en-us/purview/audit-log-enable-disable)
 - [Audit log activities](https://learn.microsoft.com/en-us/purview/audit-log-activities)
+- [New-ComplianceTag](https://learn.microsoft.com/en-us/powershell/module/exchangepowershell/new-compliancetag?view=exchange-ps)
+- [Set-ComplianceTag](https://learn.microsoft.com/en-us/powershell/module/exchangepowershell/set-compliancetag?view=exchange-ps)
+- [New-RetentionCompliancePolicy](https://learn.microsoft.com/en-us/powershell/module/exchangepowershell/new-retentioncompliancepolicy?view=exchange-ps)
+- [Set-RetentionCompliancePolicy](https://learn.microsoft.com/en-us/powershell/module/exchangepowershell/set-retentioncompliancepolicy?view=exchange-ps)
+- [New-RetentionComplianceRule](https://learn.microsoft.com/en-us/powershell/module/exchangepowershell/new-retentioncompliancerule?view=exchange-ps)

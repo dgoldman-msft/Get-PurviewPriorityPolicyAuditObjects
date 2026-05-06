@@ -1,0 +1,13 @@
+﻿# VS Code
+.vscode/
+
+# PowerShell generated files
+*.ps1xml.bak
+
+# Log and export output
+*.log
+*.csv
+
+# OS
+Thumbs.db
+Desktop.ini

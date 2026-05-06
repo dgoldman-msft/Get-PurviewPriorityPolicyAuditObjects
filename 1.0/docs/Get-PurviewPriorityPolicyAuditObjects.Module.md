@@ -12,7 +12,7 @@ Locale: en-US
 
 Retrieves and parses Microsoft Purview priority policy cleanup audit events from the Microsoft 365 Unified Audit Log.
 
-The module queries `Search-UnifiedAuditLog` using session-based paging, filters for records whose `AuditData` payload contains `prioritycleanup`, normalises each match into a typed `PurviewPriorityAuditResult` object, and optionally exports results to CSV.
+The module queries `Search-UnifiedAuditLog` using session-based paging, filters for records whose `AuditData` payload contains `prioritycleanup`, normalises each match into a typed `PurviewPriorityAuditResult` object, and optionally exports results to CSV.\n\nUse `-DumpErrors` to write full error details to `Errors.log`. Error events are stored in `$global:PurviewAuditErrors` for post-run inspection.\n\nUse `-ConnectExchangeOnline` to have the function connect to both Exchange Online and the Security & Compliance Center automatically.
 
 ## Get-PurviewPriorityPolicyAuditObjects Cmdlets
 
