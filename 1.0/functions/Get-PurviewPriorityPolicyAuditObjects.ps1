@@ -27,13 +27,16 @@
             and calls Connect-ExchangeOnline if no active session is detected. The session is
             automatically disconnected via Disconnect-ExchangeOnline when the function completes.
 
+        .PARAMETER UserPrincipalName
+            The UPN (e.g. user@contoso.com) to pass to Connect-ExchangeOnline and Connect-IPPSSession.
+            When provided, both connections use the supplied UPN for silent/certificate-based or
+            pre-authenticated flows, avoiding a second interactive logon prompt.
+            Only used when -ConnectExchangeOnline is also specified.
+
         .PARAMETER DisableBanner
             When specified together with -ConnectExchangeOnline, passes -ShowBanner:$false to
             Connect-ExchangeOnline to suppress the connection banner. Has no effect if
             -ConnectExchangeOnline is not also specified.
-
-        .PARAMETER ExportResults
-            When specified, exports the parsed results to a timestamped CSV file inside -LogDirectory.
 
         .PARAMETER ShowDetails
             When specified, writes a full per-record detail block to the console for every matched event,
@@ -42,11 +45,12 @@
 
         .PARAMETER DumpErrors
             When specified, writes all error events (CompletionStatus = 'Error') and any runtime
-            exceptions to a separate Errors.log file inside -LogDirectory. Normal run information
-            continues to go to Logging.txt. Has no effect when there are no errors.
+            exceptions to a separate timestamped Errors_<stamp>.log file inside -LogDirectory.
+            Normal run information goes to Logging_<stamp>.txt. Has no effect when there are no errors.
 
         .PARAMETER LogDirectory
-            Directory for Logging.txt and any CSV exports.
+            Directory for log files (Logging_<stamp>.txt, Errors_<stamp>.log, AuditResultObjects_<stamp>.log).
+            Each run creates new timestamped files so prior runs are preserved.
             Defaults to a 'PurviewPriorityAudit' subfolder inside $env:TEMP.
 
         .EXAMPLE
@@ -55,17 +59,19 @@
             Connects to Exchange Online and retrieves all priority cleanup audit events from the last 7 days.
 
         .EXAMPLE
-            Get-PurviewPriorityPolicyAuditObjects -StartDate (Get-Date).AddDays(-30) -EndDate (Get-Date) -ExportResults
+            Get-PurviewPriorityPolicyAuditObjects -StartDate (Get-Date).AddDays(-30) -EndDate (Get-Date) -ShowDetails
 
-            Searches the last 30 days and exports results to CSV.
+            Searches the last 30 days and displays detailed per-record output.
 
         .EXAMPLE
-            $results = Get-PurviewPriorityPolicyAuditObjects -ConnectExchangeOnline -ExportResults
+            $results = Get-PurviewPriorityPolicyAuditObjects -ConnectExchangeOnline -ShowDetails -DumpErrors
             $results | Format-Table CreationTime, Operation, User, Workload, ObjectId -AutoSize
 
         .OUTPUTS
             PurviewPriorityAuditResult — one object per matched audit event with properties:
-                CreationTime, Operation, OrganizationId, User, Workload, ObjectId, ItemType, Action, AuditEvent
+                CreationTime, Operation, CompletionStatus, RecordType, OrganizationId, User, Workload,
+                ObjectId, ItemType, Action, AuditEvent, Parameters, NonPIIParameters, ExtendedProperties,
+                RawAuditDataJson
 
         .NOTES
             Requires the ExchangeOnlineManagement module and the Audit Logs role (or equivalent) in Exchange Online.
@@ -85,10 +91,10 @@
         [switch]$ConnectExchangeOnline,
 
         [Parameter()]
-        [switch]$DisableBanner,
+        [string]$UserPrincipalName,
 
         [Parameter()]
-        [switch]$ExportResults,
+        [switch]$DisableBanner,
 
         [Parameter()]
         [switch]$ShowDetails,
@@ -97,23 +103,120 @@
         [switch]$DumpErrors,
 
         [Parameter()]
+        [switch]$StayConnected,
+
+        [Parameter()]
         [string]$LogDirectory = (Join-Path $env:TEMP 'PurviewPriorityAudit')
     )
 
     begin {
         $script:_abortRun = $false
 
-        # Internal helper — appends a line to Errors.log (only when -DumpErrors is set)
+        # Unique run stamp — all log files for this invocation share the same stamp so
+        # prior runs are never overwritten.
+        $script:_runStamp  = Get-Date -Format 'yyyyMMdd_HHmmss'
+        $script:_logFile   = Join-Path $LogDirectory "Logging_$($script:_runStamp).txt"
+        $script:_errFile   = Join-Path $LogDirectory "Errors_$($script:_runStamp).log"
+        $script:_auditFile = Join-Path $LogDirectory "AuditResultObjects_$($script:_runStamp).log"
+
+        # Internal helper — appends to the timestamped Errors log (only when -DumpErrors is set)
         function Write-ToErrorLog {
             param([string]$Message)
             if (-not $DumpErrors) { return }
-            $errorLogPath = Join-Path $LogDirectory 'Errors.log'
             try {
-                Out-File -FilePath $errorLogPath -InputObject $Message -Encoding utf8 -Append -ErrorAction Stop
+                Out-File -FilePath $script:_errFile -InputObject $Message -Encoding utf8 -Append -ErrorAction Stop
             }
             catch {
-                Write-Host "$(Get-TimeStamp) WARNING: Could not write to Errors.log: $_" -ForegroundColor DarkYellow
+                Write-Host "$(Get-TimeStamp) WARNING: Could not write to Errors log: $_" -ForegroundColor DarkYellow
             }
+        }
+
+        # Shadow the module-level Write-ToLogFile so every call in this function writes to
+        # the run-scoped timestamped log file without changing any call sites.
+        function Write-ToLogFile {
+            param(
+                [Parameter(Mandatory = $true, Position = 0)]
+                [string]$StringObject,
+                [string]$LogDirectory = '.\Logs',
+                [System.ConsoleColor]$ForegroundColor
+            )
+            try {
+                if ($PSBoundParameters.ContainsKey('ForegroundColor')) {
+                    Write-Host $StringObject -ForegroundColor $ForegroundColor
+                }
+                else {
+                    Write-Host $StringObject
+                }
+                Out-File -FilePath $script:_logFile -InputObject $StringObject -Encoding utf8 -Append -ErrorAction Stop
+            }
+            catch {
+                Write-Host "$(Get-TimeStamp) WARNING: Could not write to log: $_" -ForegroundColor DarkYellow
+            }
+        }
+
+        # Helper — writes each $result object to the per-run AuditResultObjects log (active when -ShowDetails)
+        function Write-ToAuditLog {
+            param([string]$Message)
+            try {
+                Out-File -FilePath $script:_auditFile -InputObject $Message -Encoding utf8 -Append -ErrorAction Stop
+            }
+            catch {
+                Write-Host "$(Get-TimeStamp) WARNING: Could not write to AuditResultObjects log: $_" -ForegroundColor DarkYellow
+            }
+        }
+
+        # Helper — after " -" splitting, expands any param value that starts with { as pretty-printed JSON
+        # Each JSON line is indented by $Indent under the -ParamName: label
+        function Expand-EmbeddedParamJson {
+            param([string]$ParamStr, [string]$Indent = '    ')
+            if (-not $ParamStr) { return $ParamStr }
+            $lines = $ParamStr -split "`n"
+            $out = [System.Collections.Generic.List[string]]::new()
+            foreach ($line in $lines) {
+                # Match lines like:  -ParamName "{JSON...}" (value starts with {)
+                if ($line -match '^(\s*-\w+)\s+"(\{.+)') {
+                    $paramPart = $Matches[1]
+                    $jsonPart  = $Matches[2]
+                    if ($jsonPart.EndsWith('"')) { $jsonPart = $jsonPart.Substring(0, $jsonPart.Length - 1) }
+                    $parsed = $null
+                    try { $parsed = $jsonPart | ConvertFrom-Json -Depth 10 -ErrorAction Stop } catch {}
+                    # Always put the value on its own indented line — even if JSON is truncated/unparseable
+                    $out.Add("${paramPart}:")
+                    if ($parsed) {
+                        foreach ($jl in (($parsed | ConvertTo-Json -Depth 10) -split "`n")) {
+                            $out.Add("$Indent$($jl.TrimEnd())")
+                        }
+                    } else {
+                        # Truncated/unparseable — depth-tracking character scan:
+                        # insert newlines at commas that are at property/element depth (≤3)
+                        # so each stage object and each property within it gets its own line,
+                        # but commas inside nested arrays (depth 4+) are left intact.
+                        $jChars = $jsonPart.ToCharArray()
+                        $jSb    = [System.Text.StringBuilder]::new()
+                        $jDepth = 0; $jInStr = $false; $jEsc = $false
+                        foreach ($jc in $jChars) {
+                            if ($jEsc)                    { $null = $jSb.Append($jc); $jEsc = $false; continue }
+                            if ($jc -eq '\' -and $jInStr) { $null = $jSb.Append($jc); $jEsc = $true;  continue }
+                            if ($jc -eq '"')              { $jInStr = -not $jInStr;   $null = $jSb.Append($jc); continue }
+                            if ($jInStr)                  { $null = $jSb.Append($jc); continue }
+                            if ($jc -in '{','[')          { $jDepth++ }
+                            elseif ($jc -in '}',']')      { $jDepth-- }
+                            if ($jc -eq ',' -and $jDepth -le 3) {
+                                $null = $jSb.Append($jc)
+                                $null = $jSb.AppendLine()
+                                continue
+                            }
+                            $null = $jSb.Append($jc)
+                        }
+                        foreach ($jl in ($jSb.ToString() -split "`r?`n")) {
+                            if ($jl.Trim() -ne '') { $out.Add("$Indent$($jl.TrimEnd())") }
+                        }
+                    }
+                    continue
+                }
+                $out.Add($line)
+            }
+            return $out -join "`n"
         }
 
         # Internal helper — inspects a failed audit event and returns a human-readable diagnosis
@@ -211,18 +314,16 @@
         Write-ToLogFile -StringObject "$(Get-TimeStamp) Starting Get-PurviewPriorityPolicyAuditObjects" -LogDirectory $LogDirectory
         Write-ToLogFile -StringObject "$(Get-TimeStamp) StartDate      : $StartDate" -LogDirectory $LogDirectory
         Write-ToLogFile -StringObject "$(Get-TimeStamp) EndDate        : $EndDate" -LogDirectory $LogDirectory
-        Write-ToLogFile -StringObject "$(Get-TimeStamp) ExportResults           : $ExportResults" -LogDirectory $LogDirectory
         Write-ToLogFile -StringObject "$(Get-TimeStamp) DumpErrors              : $DumpErrors" -LogDirectory $LogDirectory
         Write-ToLogFile -StringObject "$(Get-TimeStamp) DisableBanner           : $DisableBanner" -LogDirectory $LogDirectory
         Write-ToLogFile -StringObject "$(Get-TimeStamp) LogDirectory            : $LogDirectory" -LogDirectory $LogDirectory
 
         if ($DumpErrors) {
-            $errorLogPath = Join-Path $LogDirectory 'Errors.log'
             Write-ToErrorLog ("$(Get-TimeStamp) " + ("-" * 80))
-            Write-ToErrorLog "$(Get-TimeStamp) Errors.log opened — Get-PurviewPriorityPolicyAuditObjects run started"
+            Write-ToErrorLog "$(Get-TimeStamp) Errors log opened — Get-PurviewPriorityPolicyAuditObjects run started"
             Write-ToErrorLog "$(Get-TimeStamp) StartDate : $StartDate | EndDate : $EndDate"
             Write-ToErrorLog ("$(Get-TimeStamp) " + ("-" * 80))
-            Write-ToLogFile -StringObject "$(Get-TimeStamp) Error log    : $errorLogPath" -LogDirectory $LogDirectory
+            Write-ToLogFile -StringObject "$(Get-TimeStamp) Error log    : $($script:_errFile)" -LogDirectory $LogDirectory
         }
 
         # Optional auto-connect
@@ -230,29 +331,50 @@
             Write-Verbose "Auto-connecting to Exchange Online"
             Write-ToLogFile -StringObject "$(Get-TimeStamp) Checking for ExchangeOnlineManagement module" -LogDirectory $LogDirectory
 
+            $requiredEXOVersion = [version]'3.9.2'
+
             try {
-                if (-not (Get-Module -ListAvailable -Name ExchangeOnlineManagement)) {
+                $installedEXO = Get-Module -ListAvailable -Name ExchangeOnlineManagement |
+                    Sort-Object Version -Descending | Select-Object -First 1
+
+                if (-not $installedEXO) {
                     Write-ToLogFile -StringObject "$(Get-TimeStamp) ExchangeOnlineManagement not found. Installing from PSGallery..." -LogDirectory $LogDirectory
-                    Install-Module -Name ExchangeOnlineManagement -Force -AllowClobber -Scope CurrentUser -ErrorAction Stop
-                    Write-ToLogFile -StringObject "$(Get-TimeStamp) ExchangeOnlineManagement installed successfully" -LogDirectory $LogDirectory
+                    Install-Module -Name ExchangeOnlineManagement -MinimumVersion $requiredEXOVersion -Force -AllowClobber -Scope CurrentUser -ErrorAction Stop
+                    Write-ToLogFile -StringObject "$(Get-TimeStamp) ExchangeOnlineManagement $requiredEXOVersion installed successfully" -LogDirectory $LogDirectory
+                }
+                elseif ($installedEXO.Version -lt $requiredEXOVersion) {
+                    Write-ToLogFile -StringObject "$(Get-TimeStamp) ExchangeOnlineManagement $($installedEXO.Version) is below minimum $requiredEXOVersion. Updating..." -LogDirectory $LogDirectory
+                    Update-Module -Name ExchangeOnlineManagement -Force -ErrorAction Stop
+                    Write-ToLogFile -StringObject "$(Get-TimeStamp) ExchangeOnlineManagement updated to minimum $requiredEXOVersion" -LogDirectory $LogDirectory
                 }
                 else {
-                    Write-ToLogFile -StringObject "$(Get-TimeStamp) ExchangeOnlineManagement module found" -LogDirectory $LogDirectory
+                    Write-ToLogFile -StringObject "$(Get-TimeStamp) ExchangeOnlineManagement $($installedEXO.Version) found (>= $requiredEXOVersion)" -LogDirectory $LogDirectory
                 }
 
-                Import-Module ExchangeOnlineManagement -ErrorAction Stop
+                Import-Module ExchangeOnlineManagement -MinimumVersion $requiredEXOVersion -ErrorAction Stop
                 Write-ToLogFile -StringObject "$(Get-TimeStamp) ExchangeOnlineManagement imported" -LogDirectory $LogDirectory
 
                 $connectParams = @{ ErrorAction = 'Stop' }
-                if ($DisableBanner) { $connectParams['ShowBanner'] = $false }
+                if ($DisableBanner)        { $connectParams['ShowBanner']        = $false }
+                if ($UserPrincipalName)    { $connectParams['UserPrincipalName'] = $UserPrincipalName }
                 Connect-ExchangeOnline @connectParams
                 Write-Verbose "Successfully connected to Exchange Online"
                 Write-ToLogFile -StringObject "$(Get-TimeStamp) Successfully connected to Exchange Online" -LogDirectory $LogDirectory
 
+                # Resolve UPN for IPPS: prefer the explicit parameter; fall back to what
+                # Get-ConnectionInformation reports from the just-established EXO session so
+                # Connect-IPPSSession can do a silent MSAL token acquisition — no second prompt.
+                $resolvedUPN = if ($UserPrincipalName) {
+                    $UserPrincipalName
+                } else {
+                    (Get-ConnectionInformation | Select-Object -First 1).UserPrincipalName
+                }
+
                 # Connect to Security & Compliance Center (required for Search-UnifiedAuditLog)
                 Write-ToLogFile -StringObject "$(Get-TimeStamp) Connecting to Security and Compliance Center" -LogDirectory $LogDirectory
                 $ippsParams = @{ ErrorAction = 'Stop' }
-                if ($DisableBanner) { $ippsParams['ShowBanner'] = $false }
+                if ($DisableBanner)  { $ippsParams['ShowBanner']        = $false }
+                if ($resolvedUPN)    { $ippsParams['UserPrincipalName'] = $resolvedUPN }
                 Connect-IPPSSession @ippsParams
                 Write-Verbose "Successfully connected to Security and Compliance Center"
                 Write-ToLogFile -StringObject "$(Get-TimeStamp) Successfully connected to Security and Compliance Center" -LogDirectory $LogDirectory
@@ -305,6 +427,7 @@
                 $batch = Search-UnifiedAuditLog `
                     -StartDate $StartDate `
                     -EndDate $EndDate `
+                    -FreeText 'priority cleanup' `
                     -SessionId $sessionId `
                     -SessionCommand ReturnLargeSet `
                     -ResultSize 5000 `
@@ -354,8 +477,8 @@
 
         Write-ToLogFile -StringObject "$(Get-TimeStamp) Audit log retrieval complete. Total records: $($rawResults.Count)" -LogDirectory $LogDirectory
 
-        # Filter for priority cleanup-related events
-        $priority = $rawResults | Where-Object { $_.AuditData -match 'prioritycleanup' }
+        # Filter for priority cleanup-related events (server already pre-filtered via FreeText; this removes any false positives)
+        $priority = $rawResults | Where-Object { $_.AuditData -match 'priority.?cleanup' }
 
         Write-ToLogFile -StringObject "$(Get-TimeStamp) Priority cleanup records found: $($priority.Count)" -LogDirectory $LogDirectory
         Write-Verbose "Priority cleanup records found: $($priority.Count)"
@@ -393,6 +516,38 @@
                 ItemType          = if ($json) { $json.ItemType }        else { '' }
                 Action            = if ($json) { $json.Operation }       else { '' }
                 AuditEvent        = if ($json) { $json.AuditEvent }      else { '' }
+                Parameters        = if ($json -and $json.PSObject.Properties['Parameters'] -and $json.Parameters) {
+                                        if ($json.Parameters -is [string]) {
+                                            Expand-EmbeddedParamJson ($json.Parameters -replace '" -', ('"' + "`n-"))
+                                        } else {
+                                            ($json.Parameters | ForEach-Object {
+                                                $ev = if ($null -ne $_.Value) { [string]$_.Value } else { '' }
+                                                if ($ev -match '^\s*-\w') {
+                                                    "$($_.Name):`n" + ($ev -replace '" -', ('"' + "`n-"))
+                                                } else { "$($_.Name): $ev" }
+                                            }) -join "`n"
+                                        }
+                                    } else { '' }
+                NonPIIParameters  = if ($json -and $json.PSObject.Properties['NonPIIParameters'] -and $json.NonPIIParameters) {
+                                        if ($json.NonPIIParameters -is [string]) {
+                                            Expand-EmbeddedParamJson ($json.NonPIIParameters -replace '" -', ('"' + "`n-"))
+                                        } else {
+                                            ($json.NonPIIParameters | ForEach-Object {
+                                                $ev = if ($null -ne $_.Value) { [string]$_.Value } else { '' }
+                                                if ($ev -match '^\s*-\w') {
+                                                    "$($_.Name):`n" + ($ev -replace '" -', ('"' + "`n-"))
+                                                } else { "$($_.Name): $ev" }
+                                            }) -join "`n"
+                                        }
+                                    } else { '' }
+                ExtendedProperties= if ($json -and $json.PSObject.Properties['ExtendedProperties'] -and $json.ExtendedProperties) {
+                                        ($json.ExtendedProperties | ForEach-Object {
+                                            $v = if ($_.Value -is [System.Management.Automation.PSCustomObject] -or $_.Value -is [System.Object[]]) {
+                                                $_.Value | ConvertTo-Json -Depth 3 -Compress
+                                            } else { $_.Value }
+                                            "  $($_.Name): $v"
+                                        }) -join "`n"
+                                    } else { '' }
                 RawAuditDataJson  = $r.AuditData
             }
 
@@ -413,21 +568,6 @@
         }
 
         Write-ToLogFile -StringObject "$(Get-TimeStamp) Parsed and sorted $($sorted.Count) priority cleanup event(s). Errors: $($errorEvents.Count)" -LogDirectory $LogDirectory
-
-        # Optional CSV export
-        if ($ExportResults -and $sorted.Count -gt 0) {
-            $csvPath = Join-Path $LogDirectory "PurviewPriorityAudit_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-            try {
-                $sorted | Select-Object CreationTime, Operation, OrganizationId, User, Workload, ObjectId, ItemType, Action, AuditEvent |
-                    Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
-                Write-ToLogFile -StringObject "$(Get-TimeStamp) CSV exported to: $csvPath" -LogDirectory $LogDirectory -ForegroundColor Green
-                Write-Host "  CSV report : $csvPath" -ForegroundColor Green
-            }
-            catch {
-                Write-ToLogFile -StringObject "$(Get-TimeStamp) ERROR: Could not export CSV: $($_.Exception.Message)" -LogDirectory $LogDirectory
-                Write-Host "ERROR: CSV export failed: $($_.Exception.Message)" -ForegroundColor Red
-            }
-        }
 
         # Optional detailed per-record console output
         if ($ShowDetails) {
@@ -457,34 +597,131 @@
                         Write-Host ""
                         Write-Host "  -- AuditData fields --" -ForegroundColor DarkYellow
                         foreach ($prop in ($showJson.PSObject.Properties | Sort-Object Name)) {
-                            $val = $prop.Value
+                            $rawPropVal = $prop.Value
+
+                            # ── Name/Value object arrays (ExtendedProperties, Parameters-as-array, etc.) ──
+                            if ($rawPropVal -is [System.Object[]] -and $rawPropVal.Count -gt 0 -and
+                                $rawPropVal[0] -is [System.Management.Automation.PSCustomObject] -and
+                                $rawPropVal[0].PSObject.Properties['Name'] -and
+                                $rawPropVal[0].PSObject.Properties['Value']) {
+                                Write-Host ("  {0,-28}:" -f $prop.Name) -ForegroundColor DarkYellow
+                                foreach ($entry in $rawPropVal) {
+                                    $ev = if ($null -ne $entry.Value) { [string]$entry.Value } else { '' }
+                                    if ($ev -match '^\s*-\w') {
+                                        # Cmdlet-style string — split each parameter onto its own line
+                                        $ev = $ev -replace '" -', ('"' + "`n-")
+                                        Write-Host ("    {0,-24}:" -f $entry.Name) -ForegroundColor Cyan
+                                        foreach ($ln in ($ev -split "`n")) {
+                                            Write-Host "      $($ln.TrimEnd())" -ForegroundColor Gray
+                                        }
+                                    } else {
+                                        Write-Host ("    {0,-24}: {1}" -f $entry.Name, $ev) -ForegroundColor Gray
+                                    }
+                                }
+                                continue
+                            }
+
+                            $val = $rawPropVal
                             if ($null -ne $val -and ($val -is [System.Management.Automation.PSCustomObject] -or $val -is [System.Object[]])) {
                                 $val = $val | ConvertTo-Json -Depth 5 -Compress
                             }
                             # Split parameter strings so each -Name "Value" pair is on its own line
                             if ($prop.Name -in 'Parameters', 'NonPIIParameters') {
-                                $val = $val -replace '" -', ('"' + "`n      -")
+                                $val = $val -replace '" -', ('"' + "`n-")
                                 Write-Host ("  {0,-28}:" -f $prop.Name) -ForegroundColor DarkYellow
                                 foreach ($line in ($val -split "`n")) {
                                     Write-Host "    $($line.TrimEnd())" -ForegroundColor Gray
                                 }
                                 continue
                             }
+                            # Pretty-print any embedded JSON object value — each key on its own line
+                            if ($val -is [string] -and $val.TrimStart().StartsWith('{')) {
+                                $sfJson = $null
+                                try { $sfJson = $val | ConvertFrom-Json -ErrorAction Stop } catch {}
+                                if ($sfJson) {
+                                    Write-Host ("  {0,-28}:" -f $prop.Name) -ForegroundColor DarkYellow
+                                    foreach ($sfProp in $sfJson.PSObject.Properties) {
+                                        $sfVal = $sfProp.Value
+                                        if ($null -ne $sfVal -and ($sfVal -is [System.Management.Automation.PSCustomObject] -or $sfVal -is [System.Object[]])) {
+                                            $sfVal = $sfVal | ConvertTo-Json -Depth 3 -Compress
+                                        }
+                                        Write-Host ("    {0,-30}: {1}" -f $sfProp.Name, $sfVal) -ForegroundColor Gray
+                                    }
+                                    continue
+                                }
+                            }
+                            if ($prop.Name -in 'CompletionStatus', 'ResultStatus' -and [string]$val -eq 'Error') { $val = 'ERROR' }
                             Write-Host ("  {0,-28}: {1}" -f $prop.Name, $val) -ForegroundColor Gray
                         }
                     }
                 }
 
                 Write-Host "  $("-" * 78)" -ForegroundColor DarkGray
+
+                # Write the complete result object to the per-run AuditResultObjects log
+                $auditLines = [System.Text.StringBuilder]::new()
+                $null = $auditLines.AppendLine("$(Get-TimeStamp) [$counter / $($sorted.Count)] ---- AUDIT RESULT ----")
+                foreach ($p in $evt.PSObject.Properties) {
+                    if ($p.Name -eq 'PSTypeName') { continue }
+                    $pv = $p.Value
+                    if ($null -eq $pv -or $pv -eq '') { continue }
+
+                    # RawAuditDataJson: parse and write field-by-field so Parameters/NonPIIParameters
+                    # inside the raw JSON get the same " -" splitting and embedded-JSON expansion
+                    if ($p.Name -eq 'RawAuditDataJson') {
+                        $null = $auditLines.AppendLine("  RawAuditDataJson:")
+                        $rawParsed = $null
+                        try { $rawParsed = $pv | ConvertFrom-Json -ErrorAction Stop } catch {}
+                        if ($rawParsed) {
+                            foreach ($rp in ($rawParsed.PSObject.Properties | Sort-Object Name)) {
+                                $rv = $rp.Value
+                                if ($null -eq $rv) { continue }
+                                $rvStr = if ($rv -is [System.Management.Automation.PSCustomObject] -or
+                                             ($rv -is [System.Collections.IEnumerable] -and $rv -isnot [string])) {
+                                    $rv | ConvertTo-Json -Depth 10 -Compress
+                                } else { [string]$rv }
+                                if ($rp.Name -in 'Parameters', 'NonPIIParameters' -and $rvStr) {
+                                    $rvStr = Expand-EmbeddedParamJson ($rvStr -replace '" -', ('"' + "`n-")) -Indent '  '
+                                }
+                                if ($rvStr -match "`n") {
+                                    $null = $auditLines.AppendLine("    $($rp.Name):")
+                                    foreach ($rvLine in ($rvStr -split "`n")) {
+                                        $null = $auditLines.AppendLine("      $($rvLine.TrimEnd())")
+                                    }
+                                } else {
+                                    $null = $auditLines.AppendLine("    $("{0,-30}: {1}" -f $rp.Name, $rvStr)")
+                                }
+                            }
+                        } else {
+                            # JSON parse failed — write raw line-by-line as fallback
+                            foreach ($pvLine in (([string]$pv) -split "`n")) {
+                                $null = $auditLines.AppendLine("    $($pvLine.TrimEnd())")
+                            }
+                        }
+                        continue
+                    }
+
+                    $pvStr = [string]$pv
+                    if ($pvStr -match "`n") {
+                        $null = $auditLines.AppendLine("  $($p.Name):")
+                        foreach ($pvLine in ($pvStr -split "`n")) {
+                            $null = $auditLines.AppendLine("    $($pvLine.TrimEnd())")
+                        }
+                    } else {
+                        $null = $auditLines.AppendLine("  $($p.Name): $pvStr")
+                    }
+                }
+                $null = $auditLines.AppendLine("  $('-' * 78)")
+                Write-ToAuditLog $auditLines.ToString()
             }
         }
 
         Write-Host ""
         Write-Host "Scan complete. Priority cleanup events found: $($sorted.Count)" -ForegroundColor Cyan
 
-        # Write all error events silently to Errors.log — console output deferred to end{}
+        # Write all error events silently to the Errors log — console output deferred to end{}
         if ($errorEvents.Count -gt 0) {
-            Write-ToLogFile -StringObject "$(Get-TimeStamp) ERROR SUMMARY: $($errorEvents.Count) failed operation(s) — see Errors.log for details" -LogDirectory $LogDirectory
+            Write-ToLogFile -StringObject "$(Get-TimeStamp) ERROR SUMMARY: $($errorEvents.Count) failed operation(s) — see $($script:_errFile) for details" -LogDirectory $LogDirectory
 
             $errCounter = 0
             foreach ($evt in $errorEvents) {
@@ -505,20 +742,66 @@
                     if ($evtJson) {
                         Write-ToErrorLog "$(Get-TimeStamp)   -- AuditData (all fields) --"
                         foreach ($prop in ($evtJson.PSObject.Properties | Sort-Object Name)) {
-                            $val = $prop.Value
-                            if ($null -eq $val -or $val -eq '') { continue }
+                            $rawPropVal = $prop.Value
+                            if ($null -eq $rawPropVal) { continue }
+
+                            # ── Name/Value object arrays (ExtendedProperties, Parameters-as-array, etc.) ──
+                            if ($rawPropVal -is [System.Object[]] -and $rawPropVal.Count -gt 0 -and
+                                $rawPropVal[0] -is [System.Management.Automation.PSCustomObject] -and
+                                $rawPropVal[0].PSObject.Properties['Name'] -and
+                                $rawPropVal[0].PSObject.Properties['Value']) {
+                                Write-ToErrorLog ("$(Get-TimeStamp)   {0,-28}:" -f $prop.Name)
+                                foreach ($entry in $rawPropVal) {
+                                    $ev = if ($null -ne $entry.Value) { [string]$entry.Value } else { '' }
+                                    if ($ev -match '^\s*-\w') {
+                                        $ev = $ev -replace '" -', ('"' + "`n-")
+                                        Write-ToErrorLog "$(Get-TimeStamp)     $($entry.Name):"
+                                        foreach ($ln in ($ev -split "`n")) {
+                                            Write-ToErrorLog "$(Get-TimeStamp)       $($ln.TrimEnd())"
+                                        }
+                                    } else {
+                                        Write-ToErrorLog "$(Get-TimeStamp)     $("{0,-24}: {1}" -f $entry.Name, $ev)"
+                                    }
+                                }
+                                continue
+                            }
+
+                            $val = $rawPropVal
+                            if ($val -eq '') { continue }
                             if ($val -is [System.Management.Automation.PSCustomObject] -or
                                 ($val -is [System.Collections.IEnumerable] -and $val -isnot [string])) {
                                 $val = $val | ConvertTo-Json -Depth 20
                             }
                             else { $val = [string]$val }
-                            # Split parameter strings so each -Name "Value" pair is on its own line
+                            # Split parameter strings so each -Name "Value" pair is on its own line;
+                            # also expand any -ParamName "{JSON}" values into pretty-printed JSON
                             if ($prop.Name -in 'Parameters', 'NonPIIParameters') {
-                                $val = $val -replace '" -', ('"' + "`n      -")
+                                $val = Expand-EmbeddedParamJson ($val -replace '" -', ('"' + "`n-")) -Indent '    '
                             }
-                            Write-ToErrorLog ("$(Get-TimeStamp)   {0,-28}:" -f $prop.Name)
-                            foreach ($line in ($val -split "`n")) {
-                                Write-ToErrorLog "$(Get-TimeStamp)     $($line.TrimEnd())"
+                            # Pretty-print any embedded JSON object value — each key on its own line
+                            if ($val -is [string] -and $val.TrimStart().StartsWith('{')) {
+                                $sfJson = $null
+                                try { $sfJson = $val | ConvertFrom-Json -ErrorAction Stop } catch {}
+                                if ($sfJson) {
+                                    Write-ToErrorLog ("$(Get-TimeStamp)   {0,-28}:" -f $prop.Name)
+                                    foreach ($sfProp in $sfJson.PSObject.Properties) {
+                                        $sfVal = $sfProp.Value
+                                        if ($null -ne $sfVal -and ($sfVal -is [System.Management.Automation.PSCustomObject] -or $sfVal -is [System.Object[]])) {
+                                            $sfVal = $sfVal | ConvertTo-Json -Depth 3 -Compress
+                                        }
+                                        Write-ToErrorLog "$(Get-TimeStamp)     $("{0,-30}: {1}" -f $sfProp.Name, $sfVal)"
+                                    }
+                                    continue
+                                }
+                            }
+                            if ($prop.Name -in 'CompletionStatus', 'ResultStatus' -and $val -eq 'Error') { $val = 'ERROR' }
+                            if ($val -match "`n") {
+                                Write-ToErrorLog ("$(Get-TimeStamp)   {0,-28}:" -f $prop.Name)
+                                foreach ($line in ($val -split "`n")) {
+                                    Write-ToErrorLog "$(Get-TimeStamp)     $($line.TrimEnd())"
+                                }
+                            } else {
+                                Write-ToErrorLog ("$(Get-TimeStamp)   {0,-28}: {1}" -f $prop.Name, $val)
                             }
                         }
                     }
@@ -529,9 +812,12 @@
         }
 
         Write-Host ""
-        Write-Host "Log file   : $(Join-Path $LogDirectory 'Logging.txt')" -ForegroundColor Cyan
+        Write-Host "Log file   : $($script:_logFile)" -ForegroundColor Cyan
+        if ($ShowDetails) {
+            Write-Host "Audit log  : $($script:_auditFile)" -ForegroundColor Cyan
+        }
         if ($DumpErrors) {
-            Write-Host "Error log  : $(Join-Path $LogDirectory 'Errors.log')" -ForegroundColor Cyan
+            Write-Host "Error log  : $($script:_errFile)" -ForegroundColor Cyan
         }
 
         $sorted | ForEach-Object { $_ }
@@ -541,7 +827,7 @@
         # Disconnect if this function established the session.
         # Disconnect-ExchangeOnline handles both the EXO and IPPS (SCC) sessions established
         # by Connect-ExchangeOnline and Connect-IPPSSession respectively.
-        if ($ConnectExchangeOnline) {
+        if ($ConnectExchangeOnline -and -not $StayConnected) {
             try {
                 Disconnect-ExchangeOnline -Confirm:$false -ErrorAction Stop
                 Write-Verbose "Disconnected from Exchange Online and Security and Compliance Center"
@@ -569,10 +855,10 @@
             }
             Write-Host ""
             if ($DumpErrors) {
-                Write-Host "$(Get-TimeStamp) Full error details written to: $(Join-Path $LogDirectory 'Errors.log')" -ForegroundColor Yellow
+                Write-Host "$(Get-TimeStamp) Full error details written to: $($script:_errFile)" -ForegroundColor Yellow
             }
             else {
-                Write-Host "$(Get-TimeStamp) Re-run with -DumpErrors to write full error details to: $(Join-Path $LogDirectory 'Errors.log')" -ForegroundColor Yellow
+                Write-Host "$(Get-TimeStamp) Re-run with -DumpErrors to capture full error details to a timestamped Errors_<stamp>.log in: $LogDirectory" -ForegroundColor Yellow
             }
         }
     }

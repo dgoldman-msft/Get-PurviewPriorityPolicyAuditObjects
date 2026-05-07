@@ -13,7 +13,10 @@
     # Minimum PowerShell version required
     PowerShellVersion = '7.1'
 
-    # Required modules — ExchangeOnlineManagement is checked/installed at runtime
+    # ExchangeOnlineManagement >= 3.9.2 is required at runtime but NOT listed in RequiredModules.
+    # Listing it here would force PowerShell to import it at module-load time, which fails in
+    # debug sessions where the module is not yet present. Version enforcement is done at runtime
+    # inside the function when -ConnectExchangeOnline is used.
     RequiredModules   = @()
 
     # Format file
